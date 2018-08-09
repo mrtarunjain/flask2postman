@@ -5,6 +5,7 @@ import re
 import os
 import site
 import sys
+import json
 from importlib import import_module
 from time import time
 from uuid import uuid4
@@ -116,20 +117,35 @@ class Folder:
 
 class Request:
 
-    def __init__(self, name, url, method, collection_id="", data=None,
-                 data_mode="params", description="", headers=""):
+    def __init__(self, name, url, method, collection_id="", data_mode="params", **kwargs):
         self._folder = None
 
+        lower_method = method.lower()
         self.id = str(uuid4())
         self.collection_id = collection_id
-        self.data = data
-        if self.data is None:
-            self.data = []
         self.data_mode = data_mode
-        self.description = description
-        self.headers = headers
+        self.description = kwargs.get("description", "")
+        documentation = kwargs.get("documentation", {})
+
+        self.apiHeader = kwargs.get(
+            "apiHeader",
+            documentation.get(lower_method, {}).get('apiHeader')
+        )
+        self.apiParam = kwargs.get(
+            "apiParam",
+            documentation.get(lower_method, {}).get('apiParam')
+        )
+        self.apiParamExample = kwargs.get(
+            "apiParamExample",
+            documentation.get(lower_method, {}).get('apiParamExample')
+        )
+        self.apiSuccessExample = kwargs.get(
+            "apiSuccessExample",
+            documentation.get(lower_method, {}).get('apiSuccessExample')
+        )
+
         self.method = method
-        self.name = name
+        self.name = kwargs.get("view_name", name)
         self.time = get_time()
         self.url = url
 
@@ -140,7 +156,7 @@ class Request:
         return d
 
     @classmethod
-    def from_werkzeug(cls, rule, method, base_url):
+    def from_werkzeug(cls, rule, method, base_url, **kwargs):
         name = rule.endpoint.rsplit('.', 1)[-1]
         name = name.split("_", 1)[-1]
         name = name.replace("_", " ")
@@ -150,7 +166,8 @@ class Request:
             var = match.group("var")
             var_name = "{{" + match.group("var_name") + "}}"
             url = url.replace(var, var_name)
-        return cls(name, url, method)
+
+        return cls(name, url, method, **kwargs)
 
 
 # ramnes: shamelessly stolen from https://www.python.org/dev/peps/pep-0257/
@@ -197,6 +214,72 @@ def init_virtualenv():
         path = os.path.join(venv, 'lib', python, 'site-packages')
     sys.path.insert(0, path)
     site.addsitedir(path)
+
+
+def get_apidoc_data(actual_json):
+    f = open('apidoc.py', 'w')
+    request_id_to_group_name_map = {}
+    for folder in actual_json.get('folders', []):
+        for rid in folder['order']:
+            request_id_to_group_name_map[rid] = folder['name']
+
+    for req in actual_json.get('requests', []):
+        print("\"\"\"", file=f)
+        print(
+            '@api {{{method}}} {endpoint} {method}-{name}'.format(
+                method=req["method"].lower(),
+                endpoint=req["url"].replace("{{base_url}}", "").replace("{{", ":").replace("}}", ""),
+                name=req["name"]
+            ), file=f
+        )
+        print(
+            '@apiName {method}{name}'.format(method=req["method"].lower(), name=req["name"]), file=f
+        )
+        if req.get("description"):
+            print(
+                "@apiDescription {description}".format(description=req["description"]), file=f
+            )
+
+        if req.get("apiHeader"):
+            for header in req["apiHeader"]:
+                print(
+                    "@apiHeader {{String}} {key} {description}.".format(
+                        key=header["key"] if header.get("required") else "[" + header["key"] + "]",
+                        description=header["description"]
+                    ), file=f
+                )
+
+        if req.get("apiParam"):
+            for param in req["apiParam"]:
+                print(
+                    "@apiParam {{String}} {key} {description}.".format(
+                        key=param["key"] if param.get("required") else "[" + param["key"] + "]",
+                        description=param["description"]
+                    ), file=f
+                )
+
+        if req.get("apiParamExample"):
+            print(
+                "@apiParamExample {{json}} Request-Example \n {example}.".format(
+                    example=json.dumps(req["apiParamExample"])
+                ), file=f
+            )
+
+        if req.get("apiSuccessExample"):
+            print(
+                "@apiSuccessExample {{json}} Success-Response \n {example}.".format(
+                    example=json.dumps(req["apiSuccessExample"])
+                ), file=f
+            )
+
+        if req["id"]:
+            print(
+                "@apiGroup {idToName}".format(
+                    idToName=request_id_to_group_name_map.get(req["id"], "Others")
+                ), file=f
+            )
+
+        print("\"\"\"", file=f)
 
 
 def main():
@@ -261,22 +344,36 @@ def main():
             endpoint = current_app.view_functions[rule.endpoint]
             description = trim(endpoint.__doc__)
 
+            documentation = {}
+            view_class = getattr(endpoint, "view_class", None)
+            view_name = endpoint.__name__
+            if view_class:
+                view_name = view_class.__name__
+                if hasattr(view_class, "get_documentation"):
+                    documentation = view_class.get_documentation()
+
             for method in rule.methods:
                 if method in ["OPTIONS", "HEAD"] and not args.all:
                     continue
-
-                request = Request.from_werkzeug(rule, method, args.base_url)
-                request.description = description
+                request = Request.from_werkzeug(
+                    rule, method, args.base_url,
+                    description=description,
+                    documentation=documentation,
+                    view_name=view_name
+                )
                 if args.folders and folder:
                     folder.add_request(request)
                 collection.add_request(request)
 
+    actual_json = collection.to_dict()
     if args.indent:
-        json = json.dumps(collection.to_dict(), indent=4, sort_keys=True)
+        json = json.dumps(actual_json, indent=4, sort_keys=True)
     else:
-        json = json.dumps(collection.to_dict())
+        json = json.dumps(actual_json)
 
     print(json)
+    get_apidoc_data(actual_json)
+
 
 
 if __name__ == "__main__":
